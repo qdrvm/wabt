@@ -34,6 +34,10 @@
 #include "wabt/leb128.h"
 #include "wabt/stream.h"
 
+#include "coro.h"
+
+#define CO [[nodiscard]] Co
+
 #define PRINT_HEADER_NO_INDEX -1
 #define MAX_U32_LEB128_BYTES 5
 
@@ -414,8 +418,8 @@ class BinaryWriter {
   void WriteSimdLoadStoreLaneExpr(const Func* func,
                                   const Expr* expr,
                                   const char* desc);
-  void WriteExpr(const Func* func, const Expr* expr);
-  void WriteExprList(const Func* func, const ExprList& exprs);
+  CO WriteExpr(const Func* func, const Expr* expr);
+  CO WriteExprList(const Func* func, const ExprList& exprs);
   void WriteInitExpr(const ExprList& expr);
   void WriteFuncLocals(const Func* func, const LocalTypes& local_types);
   void WriteFunc(const Func* func);
@@ -706,7 +710,7 @@ void BinaryWriter::WriteSimdLoadStoreLaneExpr(const Func* func,
   stream_->WriteU8(static_cast<uint8_t>(typed_expr->val), "Simd Lane literal");
 }
 
-void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
+CO BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -739,7 +743,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Block:
       WriteOpcode(stream_, Opcode::Block);
       WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      WriteExprList(func, cast<BlockExpr>(expr)->block.exprs);
+      co_await WriteExprList(func, cast<BlockExpr>(expr)->block.exprs);
       WriteOpcode(stream_, Opcode::End);
       break;
     case ExprType::Br:
@@ -857,10 +861,10 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* if_expr = cast<IfExpr>(expr);
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
-      WriteExprList(func, if_expr->true_.exprs);
+      co_await WriteExprList(func, if_expr->true_.exprs);
       if (!if_expr->false_.empty()) {
         WriteOpcode(stream_, Opcode::Else);
-        WriteExprList(func, if_expr->false_);
+        co_await WriteExprList(func, if_expr->false_);
       }
       WriteOpcode(stream_, Opcode::End);
       break;
@@ -889,7 +893,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Loop:
       WriteOpcode(stream_, Opcode::Loop);
       WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      WriteExprList(func, cast<LoopExpr>(expr)->block.exprs);
+      co_await WriteExprList(func, cast<LoopExpr>(expr)->block.exprs);
       WriteOpcode(stream_, Opcode::End);
       break;
     case ExprType::MemoryCopy: {
@@ -1047,7 +1051,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* try_expr = cast<TryExpr>(expr);
       WriteOpcode(stream_, Opcode::Try);
       WriteBlockDecl(try_expr->block.decl);
-      WriteExprList(func, try_expr->block.exprs);
+      co_await WriteExprList(func, try_expr->block.exprs);
       switch (try_expr->kind) {
         case TryKind::Catch:
           for (const Catch& catch_ : try_expr->catches) {
@@ -1057,7 +1061,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
               WriteOpcode(stream_, Opcode::Catch);
               WriteU32Leb128(stream_, GetTagVarDepth(&catch_.var), "catch tag");
             }
-            WriteExprList(func, catch_.exprs);
+            co_await WriteExprList(func, catch_.exprs);
           }
           WriteOpcode(stream_, Opcode::End);
           break;
@@ -1123,14 +1127,14 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
   }
 }
 
-void BinaryWriter::WriteExprList(const Func* func, const ExprList& exprs) {
+CO BinaryWriter::WriteExprList(const Func* func, const ExprList& exprs) {
   for (const Expr& expr : exprs) {
-    WriteExpr(func, &expr);
+    co_await WriteExpr(func, &expr);
   }
 }
 
 void BinaryWriter::WriteInitExpr(const ExprList& expr) {
-  WriteExprList(nullptr, expr);
+  co_run(WriteExprList(nullptr, expr));
   WriteOpcode(stream_, Opcode::End);
 }
 
@@ -1151,7 +1155,7 @@ void BinaryWriter::WriteFuncLocals(const Func* func,
 
 void BinaryWriter::WriteFunc(const Func* func) {
   WriteFuncLocals(func, func->local_types);
-  WriteExprList(func, func->exprs);
+  co_run(WriteExprList(func, func->exprs));
   WriteOpcode(stream_, Opcode::End);
 }
 

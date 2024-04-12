@@ -18,8 +18,8 @@ cmake_minimum_required(VERSION 3.16)
 
 include("cmake/HunterGate.cmake")
 HunterGate(
-        URL  https://github.com/qdrvm/hunter/archive/refs/tags/v0.25.3-qdrvm1.tar.gz
-        SHA1 5fe289a63b716c51415476b531cb3648657f8485
+        URL  https://github.com/qdrvm/hunter/archive/refs/tags/v0.25.3-qdrvm7.zip
+        SHA1 be5869134ef7448fe2420d60dbb9706596b1b8bd
         LOCAL
 )
 
@@ -27,7 +27,7 @@ project(WABT LANGUAGES C CXX VERSION 1.0.34)
 
 include(GNUInstallDirs)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
