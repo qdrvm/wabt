@@ -37,6 +37,17 @@
 #define PRINT_HEADER_NO_INDEX -1
 #define MAX_U32_LEB128_BYTES 5
 
+#define _CO_WRITE_EXPR(arg) \
+  BinaryWriter& this_;      \
+  const Func* func;         \
+  arg;                      \
+  int co_i = 0;             \
+  CoFrame co_resume();
+#define CO_WRITE_EXPR _CO_WRITE_EXPR(const Expr* expr)
+#define CO_WRITE_EXPR_IF _CO_WRITE_EXPR(const IfExpr* if_expr)
+#define CO_WRITE_EXPR_TRY _CO_WRITE_EXPR(const TryExpr* try_expr)
+#define CO_WRITE_EXPR_LIST _CO_WRITE_EXPR(const ExprList& exprs)
+
 namespace wabt {
 
 void WriteStr(Stream* stream,
@@ -373,6 +384,71 @@ struct CodeMetadataSection {
 using CodeMetadataSections =
     std::unordered_map<std::string_view, CodeMetadataSection>;
 
+class BinaryWriter;
+struct CoFrame;
+struct Co_WriteExpr {
+  CO_WRITE_EXPR;
+};
+struct Co_WriteExpr_Block {
+  CO_WRITE_EXPR;
+};
+struct Co_WriteExpr_If {
+  CO_WRITE_EXPR_IF;
+};
+struct Co_WriteExpr_Loop {
+  CO_WRITE_EXPR;
+};
+struct Co_WriteExpr_Try {
+  CO_WRITE_EXPR_TRY;
+};
+struct Co_WriteExpr_Try_Catch {
+  CO_WRITE_EXPR_TRY;
+  CatchVector::const_iterator it{};
+};
+struct Co_WriteExprList {
+  CO_WRITE_EXPR_LIST;
+  Expr* it_node = nullptr;
+
+  ExprList::const_iterator getIt() {
+    return ExprList::const_iterator{exprs, it_node};
+  }
+  void setIt(const ExprList::const_iterator& it) {
+    if (it == exprs.end()) {
+      it_node = nullptr;
+    } else {
+      it_node = const_cast<Expr*>(&*it);
+    }
+  }
+};
+struct CoFrame : std::variant<nullptr_t,
+                              Co_WriteExpr,
+                              Co_WriteExpr_Block,
+                              Co_WriteExpr_If,
+                              Co_WriteExpr_Loop,
+                              Co_WriteExpr_Try,
+                              Co_WriteExpr_Try_Catch,
+                              Co_WriteExprList> {
+  using variant::variant;
+};
+struct CoResume {
+  CoFrame operator()(nullptr_t) { return nullptr; }
+  template <typename T>
+  CoFrame operator()(T&& frame) {
+    return frame.co_resume();
+  }
+};
+void co_run(CoFrame&& co) {
+  std::vector<CoFrame> stack{std::move(co)};
+  while (not stack.empty()) {
+    auto next = std::visit(CoResume{}, stack.back());
+    if (std::holds_alternative<nullptr_t>(next)) {
+      stack.pop_back();
+    } else {
+      stack.emplace_back(std::move(next));
+    }
+  }
+}
+
 class BinaryWriter {
   WABT_DISALLOW_COPY_AND_ASSIGN(BinaryWriter);
 
@@ -384,6 +460,14 @@ class BinaryWriter {
   Result WriteModule();
 
  private:
+  friend struct Co_WriteExpr;
+  friend struct Co_WriteExpr_Block;
+  friend struct Co_WriteExpr_If;
+  friend struct Co_WriteExpr_Loop;
+  friend struct Co_WriteExpr_Try;
+  friend struct Co_WriteExpr_Try_Catch;
+  friend struct Co_WriteExprList;
+
   void WriteHeader(const char* name, int index);
   Offset WriteU32Leb128Space(Offset leb_size_guess, const char* desc);
   Offset WriteFixupU32Leb128Size(Offset offset,
@@ -414,8 +498,7 @@ class BinaryWriter {
   void WriteSimdLoadStoreLaneExpr(const Func* func,
                                   const Expr* expr,
                                   const char* desc);
-  void WriteExpr(const Func* func, const Expr* expr);
-  void WriteExprList(const Func* func, const ExprList& exprs);
+  CoFrame co_WriteExpr(const Func* func, const Expr* expr);
   void WriteInitExpr(const ExprList& expr);
   void WriteFuncLocals(const Func* func, const LocalTypes& local_types);
   void WriteFunc(const Func* func);
@@ -706,7 +789,131 @@ void BinaryWriter::WriteSimdLoadStoreLaneExpr(const Func* func,
   stream_->WriteU8(static_cast<uint8_t>(typed_expr->val), "Simd Lane literal");
 }
 
-void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
+CoFrame Co_WriteExpr::co_resume() {
+  switch (co_i) {
+    case 0:
+      co_i = 1;
+      return this_.co_WriteExpr(func, expr);
+    case 1:
+      return nullptr;
+    default:
+      __builtin_unreachable();
+  }
+}
+CoFrame Co_WriteExpr_Block::co_resume() {
+  switch (co_i) {
+    case 0: {
+      auto* block_expr = cast<BlockExpr>(expr);
+      WriteOpcode(this_.stream_, Opcode::Block);
+      this_.WriteBlockDecl(block_expr->block.decl);
+      co_i = 1;
+      return Co_WriteExprList{this_, func, block_expr->block.exprs};
+    }
+    case 1:
+      WriteOpcode(this_.stream_, Opcode::End);
+      return nullptr;
+    default:
+      __builtin_unreachable();
+  }
+}
+CoFrame Co_WriteExpr_If::co_resume() {
+  switch (co_i) {
+    case 0:
+      WriteOpcode(this_.stream_, Opcode::If);
+      this_.WriteBlockDecl(if_expr->true_.decl);
+      co_i = 1;
+      return Co_WriteExprList{this_, func, if_expr->true_.exprs};
+    case 1:
+      if (!if_expr->false_.empty()) {
+        WriteOpcode(this_.stream_, Opcode::Else);
+        co_i = 2;
+        return Co_WriteExprList{this_, func, if_expr->false_};
+      }
+      [[fallthrough]];
+    case 2:
+      WriteOpcode(this_.stream_, Opcode::End);
+      return nullptr;
+    default:
+      __builtin_unreachable();
+  }
+}
+CoFrame Co_WriteExpr_Loop::co_resume() {
+  switch (co_i) {
+    case 0: {
+      auto* loop_expr = cast<LoopExpr>(expr);
+      WriteOpcode(this_.stream_, Opcode::Loop);
+      this_.WriteBlockDecl(loop_expr->block.decl);
+      co_i = 1;
+      return Co_WriteExprList{this_, func, loop_expr->block.exprs};
+    }
+    case 1:
+      WriteOpcode(this_.stream_, Opcode::End);
+      return nullptr;
+    default:
+      __builtin_unreachable();
+  }
+}
+CoFrame Co_WriteExpr_Try::co_resume() {
+  switch (co_i) {
+    case 0:
+      WriteOpcode(this_.stream_, Opcode::Try);
+      this_.WriteBlockDecl(try_expr->block.decl);
+      co_i = 1;
+      return Co_WriteExprList{this_, func, try_expr->block.exprs};
+    case 1:
+      switch (try_expr->kind) {
+        case TryKind::Catch:
+          co_i = 2;
+          return Co_WriteExpr_Try_Catch{this_, func, try_expr};
+        case TryKind::Delegate:
+          WriteOpcode(this_.stream_, Opcode::Delegate);
+          WriteU32Leb128(this_.stream_,
+                         this_.GetLabelVarDepth(&try_expr->delegate_target),
+                         "delegate depth");
+          break;
+        case TryKind::Plain:
+          WriteOpcode(this_.stream_, Opcode::End);
+          break;
+      }
+      [[fallthrough]];
+    case 2:
+      return nullptr;
+    default:
+      __builtin_unreachable();
+  }
+}
+CoFrame Co_WriteExpr_Try_Catch::co_resume() {
+  while (true) {
+    switch (co_i) {
+      case 0:
+        it = try_expr->catches.begin();
+        co_i = 1;
+        break;
+      case 1: {
+        if (it == try_expr->catches.end()) {
+          return nullptr;
+        }
+        auto& catch_ = *it;
+        if (catch_.IsCatchAll()) {
+          WriteOpcode(this_.stream_, Opcode::CatchAll);
+        } else {
+          WriteOpcode(this_.stream_, Opcode::Catch);
+          WriteU32Leb128(this_.stream_, this_.GetTagVarDepth(&catch_.var),
+                         "catch tag");
+        }
+        co_i = 2;
+        return Co_WriteExprList{this_, func, catch_.exprs};
+      }
+      case 2:
+        ++it;
+        co_i = 1;
+        break;
+      default:
+        __builtin_unreachable();
+    }
+  }
+}
+CoFrame BinaryWriter::co_WriteExpr(const Func* func, const Expr* expr) {
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -737,11 +944,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteOpcode(stream_, cast<BinaryExpr>(expr)->opcode);
       break;
     case ExprType::Block:
-      WriteOpcode(stream_, Opcode::Block);
-      WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      WriteExprList(func, cast<BlockExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      return Co_WriteExpr_Block{*this, func, expr};
     case ExprType::Br:
       WriteOpcode(stream_, Opcode::Br);
       WriteU32Leb128(stream_, GetLabelVarDepth(&cast<BrExpr>(expr)->var),
@@ -853,18 +1056,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteU32Leb128WithReloc(index, "global index", RelocType::GlobalIndexLEB);
       break;
     }
-    case ExprType::If: {
-      auto* if_expr = cast<IfExpr>(expr);
-      WriteOpcode(stream_, Opcode::If);
-      WriteBlockDecl(if_expr->true_.decl);
-      WriteExprList(func, if_expr->true_.exprs);
-      if (!if_expr->false_.empty()) {
-        WriteOpcode(stream_, Opcode::Else);
-        WriteExprList(func, if_expr->false_);
-      }
-      WriteOpcode(stream_, Opcode::End);
-      break;
-    }
+    case ExprType::If:
+      return Co_WriteExpr_If{*this, func, cast<IfExpr>(expr)};
     case ExprType::Load:
       WriteLoadStoreExpr<LoadExpr>(func, expr, "load offset");
       break;
@@ -887,11 +1080,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       break;
     }
     case ExprType::Loop:
-      WriteOpcode(stream_, Opcode::Loop);
-      WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      WriteExprList(func, cast<LoopExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      return Co_WriteExpr_Loop{*this, func, expr};
     case ExprType::MemoryCopy: {
       Index destmemidx =
           module_->GetMemoryIndex(cast<MemoryCopyExpr>(expr)->destmemidx);
@@ -1043,35 +1232,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteU32Leb128(stream_, GetTagVarDepth(&cast<ThrowExpr>(expr)->var),
                      "throw tag");
       break;
-    case ExprType::Try: {
-      auto* try_expr = cast<TryExpr>(expr);
-      WriteOpcode(stream_, Opcode::Try);
-      WriteBlockDecl(try_expr->block.decl);
-      WriteExprList(func, try_expr->block.exprs);
-      switch (try_expr->kind) {
-        case TryKind::Catch:
-          for (const Catch& catch_ : try_expr->catches) {
-            if (catch_.IsCatchAll()) {
-              WriteOpcode(stream_, Opcode::CatchAll);
-            } else {
-              WriteOpcode(stream_, Opcode::Catch);
-              WriteU32Leb128(stream_, GetTagVarDepth(&catch_.var), "catch tag");
-            }
-            WriteExprList(func, catch_.exprs);
-          }
-          WriteOpcode(stream_, Opcode::End);
-          break;
-        case TryKind::Delegate:
-          WriteOpcode(stream_, Opcode::Delegate);
-          WriteU32Leb128(stream_, GetLabelVarDepth(&try_expr->delegate_target),
-                         "delegate depth");
-          break;
-        case TryKind::Plain:
-          WriteOpcode(stream_, Opcode::End);
-          break;
-      }
-      break;
-    }
+    case ExprType::Try:
+      return Co_WriteExpr_Try{*this, func, cast<TryExpr>(expr)};
     case ExprType::Unary:
       WriteOpcode(stream_, cast<UnaryExpr>(expr)->opcode);
       break;
@@ -1121,16 +1283,38 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       break;
     }
   }
+  return nullptr;
 }
 
-void BinaryWriter::WriteExprList(const Func* func, const ExprList& exprs) {
-  for (const Expr& expr : exprs) {
-    WriteExpr(func, &expr);
+CoFrame Co_WriteExprList::co_resume() {
+  while (true) {
+    switch (co_i) {
+      case 0:
+        setIt(exprs.begin());
+        co_i = 1;
+        break;
+      case 1: {
+        auto it = getIt();
+        if (it == exprs.end()) {
+          return nullptr;
+        }
+        auto& expr = *it;
+        co_i = 2;
+        return Co_WriteExpr{this_, func, &expr};
+      }
+      case 2: {
+        setIt(++getIt());
+        co_i = 1;
+        break;
+      }
+      default:
+        __builtin_unreachable();
+    }
   }
 }
 
 void BinaryWriter::WriteInitExpr(const ExprList& expr) {
-  WriteExprList(nullptr, expr);
+  co_run(Co_WriteExprList{*this, nullptr, expr});
   WriteOpcode(stream_, Opcode::End);
 }
 
@@ -1151,7 +1335,7 @@ void BinaryWriter::WriteFuncLocals(const Func* func,
 
 void BinaryWriter::WriteFunc(const Func* func) {
   WriteFuncLocals(func, func->local_types);
-  WriteExprList(func, func->exprs);
+  co_run(Co_WriteExprList{*this, func, func->exprs});
   WriteOpcode(stream_, Opcode::End);
 }
 
