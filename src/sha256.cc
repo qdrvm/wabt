@@ -19,7 +19,7 @@
 #if HAVE_OPENSSL_SHA_H
 #include <openssl/sha.h>
 #else
-#include "picosha2.h"
+#include <picosha2.h>
 #endif
 
 namespace wabt {
