@@ -406,7 +406,7 @@ add_library(wabt::wabt ALIAS wabt)
 if (HAVE_OPENSSL_SHA_H)
   target_link_libraries(wabt OpenSSL::Crypto)
 else()
-  include_directories("${WABT_SOURCE_DIR}/third_party/picosha2")
+  include_directories("${WABT_SOURCE_DIR}/third_party/picosha2-copy")
 endif()
 
 target_compile_features(wabt PUBLIC cxx_std_17)
