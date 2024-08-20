@@ -15,6 +15,14 @@
 #
 
 cmake_minimum_required(VERSION 3.16)
+
+include("cmake/HunterGate.cmake")
+HunterGate(
+        URL  https://github.com/qdrvm/hunter/archive/refs/tags/v0.25.3-qdrvm1.tar.gz
+        SHA1 5fe289a63b716c51415476b531cb3648657f8485
+        LOCAL
+)
+
 project(WABT LANGUAGES C CXX VERSION 1.0.36)
 
 include(GNUInstallDirs)
@@ -103,14 +111,14 @@ check_symbol_exists(snprintf "stdio.h" HAVE_SNPRINTF)
 check_symbol_exists(strcasecmp "strings.h" HAVE_STRCASECMP)
 
 if (NOT USE_INTERNAL_SHA256)
-  find_package(OpenSSL QUIET)
-  if (OpenSSL_FOUND)
-    set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
-    check_include_file("openssl/sha.h" HAVE_OPENSSL_SHA_H)
-    if (HAVE_OPENSSL_SHA_H)
-      find_package_message(OpenSSL "Using OpenSSL libcrypto for SHA-256" "${HAVE_OPENSSL_SHA_H}")
-    endif()
+  hunter_add_package(OpenSSL)
+  find_package(OpenSSL REQUIRED)
+  set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+  check_include_file("openssl/sha.h" HAVE_OPENSSL_SHA_H)
+  if (NOT HAVE_OPENSSL_SHA_H)
+    message(FATAL_ERROR "OpenSSL not found and USE_INTERNAL_SHA256 is OFF")
   endif()
+  find_package_message(OpenSSL "Using OpenSSL libcrypto for SHA-256" "${HAVE_OPENSSL_SHA_H}")
 endif()
 
 if (WIN32)
@@ -398,7 +406,7 @@ add_library(wabt::wabt ALIAS wabt)
 if (HAVE_OPENSSL_SHA_H)
   target_link_libraries(wabt OpenSSL::Crypto)
 else()
-  include_directories("${WABT_SOURCE_DIR}/third_party/picosha2")
+  include_directories("${WABT_SOURCE_DIR}/third_party/picosha2-copy")
 endif()
 
 target_compile_features(wabt PUBLIC cxx_std_17)
