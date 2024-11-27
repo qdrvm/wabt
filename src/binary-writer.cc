@@ -21,8 +21,10 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <set>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "wabt/config.h"
@@ -373,6 +375,26 @@ struct CodeMetadataSection {
 using CodeMetadataSections =
     std::unordered_map<std::string_view, CodeMetadataSection>;
 
+struct State {
+  ExprList::const_iterator current_expr;
+  const Expr* expr;
+};
+
+struct BlockState : State {};
+
+struct IfState : State {
+  bool else_block;
+};
+
+struct LoopState : State {};
+
+struct CatchState : State {
+  bool catch_blocks;
+  size_t current_catch;
+};
+
+using StateVar = std::variant<BlockState, IfState, LoopState, CatchState>;
+
 class BinaryWriter {
   WABT_DISALLOW_COPY_AND_ASSIGN(BinaryWriter);
 
@@ -415,6 +437,7 @@ class BinaryWriter {
                                   const Expr* expr,
                                   const char* desc);
   void WriteExpr(const Func* func, const Expr* expr);
+  std::optional<StateVar> WriteExprImpl(const Func* func, const Expr* expr);
   void WriteExprList(const Func* func, const ExprList& exprs);
   void WriteInitExpr(const ExprList& expr);
   void WriteFuncLocals(const Func* func, const LocalTypes& local_types);
@@ -706,7 +729,8 @@ void BinaryWriter::WriteSimdLoadStoreLaneExpr(const Func* func,
   stream_->WriteU8(static_cast<uint8_t>(typed_expr->val), "Simd Lane literal");
 }
 
-void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
+std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
+                                                    const Expr* expr) {
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -739,9 +763,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Block:
       WriteOpcode(stream_, Opcode::Block);
       WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      WriteExprList(func, cast<BlockExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      return BlockState{cast<BlockExpr>(expr)->block.exprs.begin(), expr};
+
     case ExprType::Br:
       WriteOpcode(stream_, Opcode::Br);
       WriteU32Leb128(stream_, GetLabelVarDepth(&cast<BrExpr>(expr)->var),
@@ -857,13 +880,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* if_expr = cast<IfExpr>(expr);
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
-      WriteExprList(func, if_expr->true_.exprs);
-      if (!if_expr->false_.empty()) {
-        WriteOpcode(stream_, Opcode::Else);
-        WriteExprList(func, if_expr->false_);
-      }
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      return IfState{if_expr->true_.exprs.begin(), expr, false};
     }
     case ExprType::Load:
       WriteLoadStoreExpr<LoadExpr>(func, expr, "load offset");
@@ -889,9 +906,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Loop:
       WriteOpcode(stream_, Opcode::Loop);
       WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      WriteExprList(func, cast<LoopExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      return LoopState{cast<LoopExpr>(expr)->block.exprs.begin(), expr};
+
     case ExprType::MemoryCopy: {
       Index destmemidx =
           module_->GetMemoryIndex(cast<MemoryCopyExpr>(expr)->destmemidx);
@@ -1047,30 +1063,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* try_expr = cast<TryExpr>(expr);
       WriteOpcode(stream_, Opcode::Try);
       WriteBlockDecl(try_expr->block.decl);
-      WriteExprList(func, try_expr->block.exprs);
-      switch (try_expr->kind) {
-        case TryKind::Catch:
-          for (const Catch& catch_ : try_expr->catches) {
-            if (catch_.IsCatchAll()) {
-              WriteOpcode(stream_, Opcode::CatchAll);
-            } else {
-              WriteOpcode(stream_, Opcode::Catch);
-              WriteU32Leb128(stream_, GetTagVarDepth(&catch_.var), "catch tag");
-            }
-            WriteExprList(func, catch_.exprs);
-          }
-          WriteOpcode(stream_, Opcode::End);
-          break;
-        case TryKind::Delegate:
-          WriteOpcode(stream_, Opcode::Delegate);
-          WriteU32Leb128(stream_, GetLabelVarDepth(&try_expr->delegate_target),
-                         "delegate depth");
-          break;
-        case TryKind::Plain:
-          WriteOpcode(stream_, Opcode::End);
-          break;
-      }
-      break;
+      return CatchState{try_expr->block.exprs.begin(), expr, false, 0};
     }
     case ExprType::Unary:
       WriteOpcode(stream_, cast<UnaryExpr>(expr)->opcode);
@@ -1119,6 +1112,131 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       Offset code_offset = stream_->offset() - cur_func_start_offset_;
       a.entries.emplace_back(code_offset, meta_expr->data);
       break;
+    }
+  }
+  return std::nullopt;
+}
+
+void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
+  std::vector<StateVar> stack;
+
+  auto write_expr = [&stack, func, this](const Expr* expr) {
+    auto opt_state = WriteExprImpl(func, expr);
+    if (opt_state.has_value()) {
+      auto& state = *opt_state;
+      stack.push_back(state);
+    }
+  };
+
+  write_expr(top_expr);
+
+  while (!stack.empty()) {
+    auto& state = stack.back();
+    if (BlockState* block_state = std::get_if<BlockState>(&state)) {
+      auto& expr_list = cast<BlockExpr>(block_state->expr)->block.exprs;
+      if (block_state->current_expr != expr_list.end()) {
+        write_expr(&*block_state->current_expr);
+        ++block_state->current_expr;
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        stack.pop_back();
+      }
+    }
+
+    if (IfState* if_state = std::get_if<IfState>(&state)) {
+      auto* if_expr = cast<IfExpr>(if_state->expr);
+      if (!if_state->else_block) {
+        auto& expr_list = if_expr->true_.exprs;
+        if (if_state->current_expr != expr_list.end()) {
+          write_expr(&*if_state->current_expr);
+          ++if_state->current_expr;
+        } else {
+          if (!if_expr->false_.empty()) {
+            WriteOpcode(stream_, Opcode::Else);
+            if_state->else_block = true;
+          } else {
+            WriteOpcode(stream_, Opcode::End);
+            stack.pop_back();
+          }
+        }
+      } else if (!if_expr->false_.empty()) {
+        auto& expr_list = cast<IfExpr>(if_state->expr)->false_;
+
+        if (if_state->current_expr != expr_list.end()) {
+          write_expr(&*if_state->current_expr);
+          ++if_state->current_expr;
+        } else {
+          WriteOpcode(stream_, Opcode::End);
+          stack.pop_back();
+        }
+      }
+    }
+
+    if (LoopState* loop_state = std::get_if<LoopState>(&state)) {
+      auto& expr_list = cast<LoopExpr>(loop_state->expr)->block.exprs;
+      if (loop_state->current_expr != expr_list.end()) {
+        write_expr(&*loop_state->current_expr);
+        ++loop_state->current_expr;
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        stack.pop_back();
+      }
+    }
+
+    if (CatchState* catch_state = std::get_if<CatchState>(&state)) {
+      if (!catch_state->catch_blocks) {
+        auto& expr_list = cast<TryExpr>(catch_state->expr)->block.exprs;
+        if (catch_state->current_expr != expr_list.end()) {
+          write_expr(&*catch_state->current_expr);
+          ++catch_state->current_expr;
+        } else {
+          auto* try_expr = cast<TryExpr>(catch_state->expr);
+          switch (try_expr->kind) {
+            case TryKind::Catch:
+              catch_state->catch_blocks = true;
+              break;
+            case TryKind::Delegate:
+              WriteOpcode(stream_, Opcode::Delegate);
+              WriteU32Leb128(stream_,
+                             GetLabelVarDepth(&try_expr->delegate_target),
+                             "delegate depth");
+              stack.pop_back();
+              break;
+            case TryKind::Plain:
+              WriteOpcode(stream_, Opcode::End);
+              stack.pop_back();
+              break;
+          }
+        }
+      } else {
+        auto& catch_list = cast<TryExpr>(catch_state->expr)->catches;
+        if (catch_state->current_catch < catch_list.size()) {
+          auto& current_catch = catch_list[catch_state->current_catch];
+          auto& expr_list = catch_list[catch_state->current_catch].exprs;
+          if (catch_state->current_expr == expr_list.begin()) {
+            if (current_catch.IsCatchAll()) {
+              WriteOpcode(stream_, Opcode::CatchAll);
+            } else {
+              WriteOpcode(stream_, Opcode::Catch);
+              WriteU32Leb128(stream_, GetTagVarDepth(&current_catch.var),
+                             "catch tag");
+            }
+          }
+          if (catch_state->current_expr != expr_list.end()) {
+            write_expr(&*catch_state->current_expr);
+            ++catch_state->current_expr;
+
+          } else {
+            ++catch_state->current_catch;
+            catch_state->current_expr =
+                catch_list[catch_state->current_catch].exprs.begin();
+          }
+
+        } else {
+          WriteOpcode(stream_, Opcode::End);
+          stack.pop_back();
+        }
+      }
     }
   }
 }
