@@ -1152,13 +1152,14 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
           if (!if_expr->false_.empty()) {
             WriteOpcode(stream_, Opcode::Else);
             if_state->else_block = true;
+            if_state->current_expr = if_expr->false_.begin();
           } else {
             WriteOpcode(stream_, Opcode::End);
             stack.pop_back();
           }
         }
       } else if (!if_expr->false_.empty()) {
-        auto& expr_list = cast<IfExpr>(if_state->expr)->false_;
+        auto& expr_list = if_expr->false_;
 
         if (if_state->current_expr != expr_list.end()) {
           write_expr(&*if_state->current_expr);
@@ -1188,6 +1189,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
           switch (try_expr->kind) {
             case TryKind::Catch:
               catch_state->catch_blocks = true;
+              catch_state->current_expr = try_expr->catches[0].exprs.begin();
               break;
             case TryKind::Delegate:
               WriteOpcode(stream_, Opcode::Delegate);
