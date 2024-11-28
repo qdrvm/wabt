@@ -375,26 +375,6 @@ struct CodeMetadataSection {
 using CodeMetadataSections =
     std::unordered_map<std::string_view, CodeMetadataSection>;
 
-struct State {
-  ExprList::const_iterator current_expr;
-  const Expr* expr;
-};
-
-struct BlockState : State {};
-
-struct IfState : State {
-  bool else_block;
-};
-
-struct LoopState : State {};
-
-struct CatchState : State {
-  bool catch_blocks;
-  size_t current_catch;
-};
-
-using StateVar = std::variant<BlockState, IfState, LoopState, CatchState>;
-
 class BinaryWriter {
   WABT_DISALLOW_COPY_AND_ASSIGN(BinaryWriter);
 
@@ -406,6 +386,75 @@ class BinaryWriter {
   Result WriteModule();
 
  private:
+  struct State {
+   public:
+    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {}
+
+    virtual bool advance(class BinaryWriter& writer, const Func* func) = 0;
+    const Expr* get_current_expr() const { return &*current_expr; }
+
+   protected:
+    ExprList::const_iterator current_expr;
+  };
+
+  template <typename ExprType>
+  struct StateBase : State {
+    StateBase(ExprList::const_iterator current_expr, const ExprType* expr)
+        : State(current_expr), expr(expr) {}
+
+   protected:
+    const ExprType* expr;
+  };
+
+  template <ExprType T>
+  struct BlockState final : StateBase<BlockExprBase<T>> {
+    explicit BlockState(const BlockExprBase<T>* expr)
+        : StateBase<BlockExprBase<T>>{expr->block.exprs.begin(), expr} {}
+
+    bool advance(class BinaryWriter& writer, const Func* func) override;
+
+    bool is_over() const {
+      return this->current_expr == this->expr->block.exprs.end();
+    }
+  };
+
+  struct IfState final : StateBase<IfExpr> {
+    explicit IfState(const IfExpr* expr)
+        : StateBase{expr->true_.exprs.begin(), expr} {}
+
+    bool advance(class BinaryWriter& writer, const Func* func) override;
+
+    bool is_over() const {
+      return (in_else && !expr->false_.empty() &&
+              current_expr == expr->false_.end()) ||
+             (!in_else && current_expr == expr->true_.exprs.end());
+    }
+
+   private:
+    bool in_else = false;
+  };
+
+  struct TryState final : StateBase<TryExpr> {
+    explicit TryState(const TryExpr* expr)
+        : StateBase{expr->block.exprs.begin(), expr} {}
+    bool advance(class BinaryWriter& writer, const Func* func) override;
+
+    bool is_over() const {
+      return (!in_catch && current_expr == expr->block.exprs.end()) ||
+             (in_catch &&
+              current_expr == expr->catches[current_catch].exprs.end());
+    }
+
+   private:
+    bool in_catch = false;
+    size_t current_catch = 0;
+  };
+
+  using StateVar = std::variant<BlockState<ExprType::Loop>,
+                                BlockState<ExprType::Block>,
+                                IfState,
+                                TryState>;
+
   void WriteHeader(const char* name, int index);
   Offset WriteU32Leb128Space(Offset leb_size_guess, const char* desc);
   Offset WriteFixupU32Leb128Size(Offset offset,
@@ -489,6 +538,88 @@ static uint8_t log2_u32(uint32_t x) {
     result++;
   }
   return result;
+}
+
+template <ExprType T>
+bool BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
+                                          const Func* func) {
+  if (!is_over()) {
+    ++this->current_expr;
+    if (is_over()) {
+      WriteOpcode(writer.stream_, Opcode::End);
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool BinaryWriter::IfState::advance(class BinaryWriter& writer,
+                                    const Func* func) {
+  if (!is_over()) {
+    ++current_expr;
+    if (is_over()) {
+      if (!in_else && !expr->false_.empty()) {
+        WriteOpcode(writer.stream_, Opcode::Else);
+        in_else = true;
+        current_expr = expr->false_.begin();
+
+        return true;
+      } else {
+        WriteOpcode(writer.stream_, Opcode::End);
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+bool BinaryWriter::TryState::advance(class BinaryWriter& writer,
+                                     const Func* func) {
+  if (!is_over()) {
+    ++current_expr;
+    if (is_over()) {
+      if (!in_catch) {
+        switch (expr->kind) {
+          case TryKind::Catch:
+            in_catch = true;
+            goto CATCH_START;
+            break;
+          case TryKind::Delegate:
+            WriteOpcode(writer.stream_, Opcode::Delegate);
+            WriteU32Leb128(writer.stream_,
+                           writer.GetLabelVarDepth(&expr->delegate_target),
+                           "delegate depth");
+            return false;
+          case TryKind::Plain:
+            WriteOpcode(writer.stream_, Opcode::End);
+            return false;
+        }
+      } else {
+        ++current_catch;
+        if (current_catch < expr->catches.size()) {
+        CATCH_START:
+          current_expr = expr->catches[current_catch].exprs.begin();
+          auto& current_catch_expr = expr->catches[current_catch];
+
+          if (current_catch_expr.IsCatchAll()) {
+            WriteOpcode(writer.stream_, Opcode::CatchAll);
+          } else {
+            WriteOpcode(writer.stream_, Opcode::Catch);
+            WriteU32Leb128(writer.stream_,
+                           writer.GetTagVarDepth(&current_catch_expr.var),
+                           "catch tag");
+          }
+
+          return true;
+        } else {
+          WriteOpcode(writer.stream_, Opcode::End);
+          return false;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 BinaryWriter::BinaryWriter(Stream* stream,
@@ -648,9 +779,9 @@ void BinaryWriter::AddReloc(RelocType reloc_type, Index index) {
   size_t offset = stream_->offset() - last_section_payload_offset_;
   Index symbol_index = GetSymbolIndex(reloc_type, index);
   if (symbol_index == kInvalidIndex) {
-    // The file is invalid, for example a reference to function 42 where only 10
-    // functions are defined.  The user must have already passed --no-check, so
-    // no extra warning here is needed.
+    // The file is invalid, for example a reference to function 42 where only
+    // 10 functions are defined.  The user must have already passed
+    // --no-check, so no extra warning here is needed.
     return;
   }
   current_reloc_section_->relocations.emplace_back(reloc_type, offset,
@@ -680,8 +811,8 @@ void BinaryWriter::WriteS32Leb128WithReloc(int32_t value,
 }
 
 void BinaryWriter::WriteTableNumberWithReloc(Index value, const char* desc) {
-  // Unless reference types are enabled, all references to tables refer to table
-  // 0, so no relocs need be emitted when making relocatable binaries.
+  // Unless reference types are enabled, all references to tables refer to
+  // table 0, so no relocs need be emitted when making relocatable binaries.
   if (options_.relocatable && options_.features.reference_types_enabled()) {
     AddReloc(RelocType::TableNumberLEB, value);
     WriteFixedS32Leb128(stream_, value, desc);
@@ -729,8 +860,9 @@ void BinaryWriter::WriteSimdLoadStoreLaneExpr(const Func* func,
   stream_->WriteU8(static_cast<uint8_t>(typed_expr->val), "Simd Lane literal");
 }
 
-std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
-                                                    const Expr* expr) {
+std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
+    const Func* func,
+    const Expr* expr) {
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -763,7 +895,7 @@ std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
     case ExprType::Block:
       WriteOpcode(stream_, Opcode::Block);
       WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      return BlockState{cast<BlockExpr>(expr)->block.exprs.begin(), expr};
+      return BlockState<ExprType::Block>{cast<BlockExpr>(expr)};
 
     case ExprType::Br:
       WriteOpcode(stream_, Opcode::Br);
@@ -880,7 +1012,7 @@ std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
       auto* if_expr = cast<IfExpr>(expr);
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
-      return IfState{if_expr->true_.exprs.begin(), expr, false};
+      return IfState{if_expr};
     }
     case ExprType::Load:
       WriteLoadStoreExpr<LoadExpr>(func, expr, "load offset");
@@ -906,7 +1038,7 @@ std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
     case ExprType::Loop:
       WriteOpcode(stream_, Opcode::Loop);
       WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      return LoopState{cast<LoopExpr>(expr)->block.exprs.begin(), expr};
+      return BlockState<ExprType::Loop>{cast<LoopExpr>(expr)};
 
     case ExprType::MemoryCopy: {
       Index destmemidx =
@@ -1063,7 +1195,7 @@ std::optional<StateVar> BinaryWriter::WriteExprImpl(const Func* func,
       auto* try_expr = cast<TryExpr>(expr);
       WriteOpcode(stream_, Opcode::Try);
       WriteBlockDecl(try_expr->block.decl);
-      return CatchState{try_expr->block.exprs.begin(), expr, false, 0};
+      return TryState{try_expr};
     }
     case ExprType::Unary:
       WriteOpcode(stream_, cast<UnaryExpr>(expr)->opcode);
@@ -1131,108 +1263,11 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
   write_expr(top_expr);
 
   while (!stack.empty()) {
-    auto& state = stack.back();
-    if (BlockState* block_state = std::get_if<BlockState>(&state)) {
-      auto& expr_list = cast<BlockExpr>(block_state->expr)->block.exprs;
-      if (block_state->current_expr != expr_list.end()) {
-        write_expr(&*block_state->current_expr);
-        ++block_state->current_expr;
-      } else {
-        WriteOpcode(stream_, Opcode::End);
-        stack.pop_back();
-      }
-    } else if (IfState* if_state = std::get_if<IfState>(&state)) {
-      auto* if_expr = cast<IfExpr>(if_state->expr);
-      if (!if_state->else_block) {
-        auto& expr_list = if_expr->true_.exprs;
-        if (if_state->current_expr != expr_list.end()) {
-          write_expr(&*if_state->current_expr);
-          ++if_state->current_expr;
-        } else {
-          if (!if_expr->false_.empty()) {
-            WriteOpcode(stream_, Opcode::Else);
-            if_state->else_block = true;
-            if_state->current_expr = if_expr->false_.begin();
-          } else {
-            WriteOpcode(stream_, Opcode::End);
-            stack.pop_back();
-          }
-        }
-      } else if (!if_expr->false_.empty()) {
-        auto& expr_list = if_expr->false_;
-
-        if (if_state->current_expr != expr_list.end()) {
-          write_expr(&*if_state->current_expr);
-          ++if_state->current_expr;
-        } else {
-          WriteOpcode(stream_, Opcode::End);
-          stack.pop_back();
-        }
-      }
-    } else if (LoopState* loop_state = std::get_if<LoopState>(&state)) {
-      auto& expr_list = cast<LoopExpr>(loop_state->expr)->block.exprs;
-      if (loop_state->current_expr != expr_list.end()) {
-        write_expr(&*loop_state->current_expr);
-        ++loop_state->current_expr;
-      } else {
-        WriteOpcode(stream_, Opcode::End);
-        stack.pop_back();
-      }
-    } else if (CatchState* catch_state = std::get_if<CatchState>(&state)) {
-      if (!catch_state->catch_blocks) {
-        auto& expr_list = cast<TryExpr>(catch_state->expr)->block.exprs;
-        if (catch_state->current_expr != expr_list.end()) {
-          write_expr(&*catch_state->current_expr);
-          ++catch_state->current_expr;
-        } else {
-          auto* try_expr = cast<TryExpr>(catch_state->expr);
-          switch (try_expr->kind) {
-            case TryKind::Catch:
-              catch_state->catch_blocks = true;
-              catch_state->current_expr = try_expr->catches[0].exprs.begin();
-              break;
-            case TryKind::Delegate:
-              WriteOpcode(stream_, Opcode::Delegate);
-              WriteU32Leb128(stream_,
-                             GetLabelVarDepth(&try_expr->delegate_target),
-                             "delegate depth");
-              stack.pop_back();
-              break;
-            case TryKind::Plain:
-              WriteOpcode(stream_, Opcode::End);
-              stack.pop_back();
-              break;
-          }
-        }
-      } else {
-        auto& catch_list = cast<TryExpr>(catch_state->expr)->catches;
-        if (catch_state->current_catch < catch_list.size()) {
-          auto& current_catch = catch_list[catch_state->current_catch];
-          auto& expr_list = catch_list[catch_state->current_catch].exprs;
-          if (catch_state->current_expr == expr_list.begin()) {
-            if (current_catch.IsCatchAll()) {
-              WriteOpcode(stream_, Opcode::CatchAll);
-            } else {
-              WriteOpcode(stream_, Opcode::Catch);
-              WriteU32Leb128(stream_, GetTagVarDepth(&current_catch.var),
-                             "catch tag");
-            }
-          }
-          if (catch_state->current_expr != expr_list.end()) {
-            write_expr(&*catch_state->current_expr);
-            ++catch_state->current_expr;
-
-          } else {
-            ++catch_state->current_catch;
-            catch_state->current_expr =
-                catch_list[catch_state->current_catch].exprs.begin();
-          }
-
-        } else {
-          WriteOpcode(stream_, Opcode::End);
-          stack.pop_back();
-        }
-      }
+    State& state =
+        std::visit([](auto& state) -> State& { return state; }, stack.back());
+    write_expr(state.get_current_expr());
+    if (state.advance(*this, func)) {
+      stack.pop_back();
     }
   }
 }
@@ -1730,7 +1765,8 @@ Result BinaryWriter::WriteModule() {
     EndSection();
   }
 
-  // Remove the DataCount section if there are no instructions that require it.
+  // Remove the DataCount section if there are no instructions that require
+  // it.
   if (options_.features.bulk_memory_enabled() &&
       module_->data_segments.size() && !has_data_segment_instruction_) {
     Offset size = stream_->offset() - data_count_end_;
@@ -1747,8 +1783,8 @@ Result BinaryWriter::WriteModule() {
 
     --section_count_;
 
-    // We just effectively decremented the code section's index; adjust anything
-    // that might have captured it.
+    // We just effectively decremented the code section's index; adjust
+    // anything that might have captured it.
     for (RelocSection& section : reloc_sections_) {
       if (section.section_index == section_count_) {
         assert(last_section_type_ == BinarySection::Code);
