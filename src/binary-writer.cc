@@ -1141,9 +1141,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
         WriteOpcode(stream_, Opcode::End);
         stack.pop_back();
       }
-    }
-
-    if (IfState* if_state = std::get_if<IfState>(&state)) {
+    } else if (IfState* if_state = std::get_if<IfState>(&state)) {
       auto* if_expr = cast<IfExpr>(if_state->expr);
       if (!if_state->else_block) {
         auto& expr_list = if_expr->true_.exprs;
@@ -1170,9 +1168,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
           stack.pop_back();
         }
       }
-    }
-
-    if (LoopState* loop_state = std::get_if<LoopState>(&state)) {
+    } else if (LoopState* loop_state = std::get_if<LoopState>(&state)) {
       auto& expr_list = cast<LoopExpr>(loop_state->expr)->block.exprs;
       if (loop_state->current_expr != expr_list.end()) {
         write_expr(&*loop_state->current_expr);
@@ -1181,9 +1177,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
         WriteOpcode(stream_, Opcode::End);
         stack.pop_back();
       }
-    }
-
-    if (CatchState* catch_state = std::get_if<CatchState>(&state)) {
+    } else if (CatchState* catch_state = std::get_if<CatchState>(&state)) {
       if (!catch_state->catch_blocks) {
         auto& expr_list = cast<TryExpr>(catch_state->expr)->block.exprs;
         if (catch_state->current_expr != expr_list.end()) {
