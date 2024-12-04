@@ -25,7 +25,7 @@
 #include <set>
 #include <string_view>
 #include <variant>
-#include <vector>
+#include <list>
 
 #include "wabt/config.h"
 
@@ -1250,7 +1250,7 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
 }
 
 void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
-  std::vector<StateVar> stack;
+  std::list<StateVar> stack;
 
   auto write_expr = [&stack, func, this](const Expr* expr) {
     auto opt_state = WriteExprImpl(func, expr);
