@@ -21,11 +21,11 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <list>
 #include <optional>
 #include <set>
 #include <string_view>
 #include <variant>
-#include <list>
 
 #include "wabt/config.h"
 
@@ -375,6 +375,11 @@ struct CodeMetadataSection {
 using CodeMetadataSections =
     std::unordered_map<std::string_view, CodeMetadataSection>;
 
+enum class Continuation {
+  CONTINUE,
+  FRAME_OVER,
+};
+
 class BinaryWriter {
   WABT_DISALLOW_COPY_AND_ASSIGN(BinaryWriter);
 
@@ -388,9 +393,14 @@ class BinaryWriter {
  private:
   struct State {
    public:
-    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {}
+    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {
+      // debug check not null
+      current_expr++;
+      current_expr--;
+    }
 
-    virtual bool advance(class BinaryWriter& writer, const Func* func) = 0;
+    virtual Continuation advance(class BinaryWriter& writer,
+                                 const Func* func) = 0;
     const Expr* get_current_expr() const { return &*current_expr; }
 
    protected:
@@ -411,7 +421,7 @@ class BinaryWriter {
     explicit BlockState(const BlockExprBase<T>* expr)
         : StateBase<BlockExprBase<T>>{expr->block.exprs.begin(), expr} {}
 
-    bool advance(class BinaryWriter& writer, const Func* func) override;
+    Continuation advance(class BinaryWriter& writer, const Func* func) override;
 
     bool is_over() const {
       return this->current_expr == this->expr->block.exprs.end();
@@ -422,7 +432,7 @@ class BinaryWriter {
     explicit IfState(const IfExpr* expr)
         : StateBase{expr->true_.exprs.begin(), expr} {}
 
-    bool advance(class BinaryWriter& writer, const Func* func) override;
+    Continuation advance(class BinaryWriter& writer, const Func* func) override;
 
     bool is_over() const {
       return (in_else && !expr->false_.empty() &&
@@ -437,7 +447,7 @@ class BinaryWriter {
   struct TryState final : StateBase<TryExpr> {
     explicit TryState(const TryExpr* expr)
         : StateBase{expr->block.exprs.begin(), expr} {}
-    bool advance(class BinaryWriter& writer, const Func* func) override;
+    Continuation advance(class BinaryWriter& writer, const Func* func) override;
 
     bool is_over() const {
       return (!in_catch && current_expr == expr->block.exprs.end()) ||
@@ -541,20 +551,20 @@ static uint8_t log2_u32(uint32_t x) {
 }
 
 template <ExprType T>
-bool BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
-                                          const Func* func) {
+Continuation BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
+                                                  const Func* func) {
   if (!is_over()) {
     ++this->current_expr;
     if (is_over()) {
       WriteOpcode(writer.stream_, Opcode::End);
-      return false;
+      return Continuation::FRAME_OVER;
     }
-    return true;
+    return Continuation::CONTINUE;
   }
-  return false;
+  return Continuation::FRAME_OVER;
 }
 
-bool BinaryWriter::IfState::advance(class BinaryWriter& writer,
+Continuation BinaryWriter::IfState::advance(class BinaryWriter& writer,
                                     const Func* func) {
   if (!is_over()) {
     ++current_expr;
@@ -564,17 +574,17 @@ bool BinaryWriter::IfState::advance(class BinaryWriter& writer,
         in_else = true;
         current_expr = expr->false_.begin();
 
-        return true;
+        return Continuation::CONTINUE;
       } else {
         WriteOpcode(writer.stream_, Opcode::End);
-        return false;
+        return Continuation::FRAME_OVER;
       }
     }
   }
-  return false;
+  return Continuation::FRAME_OVER;
 }
 
-bool BinaryWriter::TryState::advance(class BinaryWriter& writer,
+Continuation BinaryWriter::TryState::advance(class BinaryWriter& writer,
                                      const Func* func) {
   if (!is_over()) {
     ++current_expr;
@@ -590,10 +600,10 @@ bool BinaryWriter::TryState::advance(class BinaryWriter& writer,
             WriteU32Leb128(writer.stream_,
                            writer.GetLabelVarDepth(&expr->delegate_target),
                            "delegate depth");
-            return false;
+            return Continuation::FRAME_OVER;
           case TryKind::Plain:
             WriteOpcode(writer.stream_, Opcode::End);
-            return false;
+            return Continuation::FRAME_OVER;
         }
       } else {
         ++current_catch;
@@ -611,15 +621,15 @@ bool BinaryWriter::TryState::advance(class BinaryWriter& writer,
                            "catch tag");
           }
 
-          return true;
+          return Continuation::CONTINUE;
         } else {
           WriteOpcode(writer.stream_, Opcode::End);
-          return false;
+          return Continuation::FRAME_OVER;
         }
       }
     }
   }
-  return false;
+  return Continuation::FRAME_OVER;
 }
 
 BinaryWriter::BinaryWriter(Stream* stream,
@@ -1266,7 +1276,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
     State& state =
         std::visit([](auto& state) -> State& { return state; }, stack.back());
     write_expr(state.get_current_expr());
-    if (state.advance(*this, func)) {
+    if (state.advance(*this, func) == Continuation::FRAME_OVER) {
       stack.pop_back();
     }
   }
