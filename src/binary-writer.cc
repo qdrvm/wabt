@@ -1272,7 +1272,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
     State& state =
         std::visit([](auto& state) -> State& { return state; }, stack.back());
     write_expr(state.get_current_expr());
-    while (state.advance(*this, func) == Continuation::FRAME_OVER) {
+    while (!stack.empty() && state.advance(*this, func) == Continuation::FRAME_OVER) {
       stack.pop_back();
     }
   }
