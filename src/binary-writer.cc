@@ -393,11 +393,7 @@ class BinaryWriter {
  private:
   struct State {
    public:
-    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {
-      // debug check not null
-      current_expr++;
-      current_expr--;
-    }
+    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {}
 
     virtual Continuation advance(class BinaryWriter& writer,
                                  const Func* func) = 0;
@@ -565,7 +561,7 @@ Continuation BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
 }
 
 Continuation BinaryWriter::IfState::advance(class BinaryWriter& writer,
-                                    const Func* func) {
+                                            const Func* func) {
   if (!is_over()) {
     ++current_expr;
     if (is_over()) {
@@ -585,7 +581,7 @@ Continuation BinaryWriter::IfState::advance(class BinaryWriter& writer,
 }
 
 Continuation BinaryWriter::TryState::advance(class BinaryWriter& writer,
-                                     const Func* func) {
+                                             const Func* func) {
   if (!is_over()) {
     ++current_expr;
     if (is_over()) {
@@ -1276,7 +1272,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
     State& state =
         std::visit([](auto& state) -> State& { return state; }, stack.back());
     write_expr(state.get_current_expr());
-    if (state.advance(*this, func) == Continuation::FRAME_OVER) {
+    while (state.advance(*this, func) == Continuation::FRAME_OVER) {
       stack.pop_back();
     }
   }
