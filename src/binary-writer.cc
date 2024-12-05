@@ -560,6 +560,7 @@ Continuation BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
     }
     return Continuation::CONTINUE;
   }
+  WriteOpcode(writer.stream_, Opcode::End);
   return Continuation::FRAME_OVER;
 }
 
@@ -581,6 +582,7 @@ Continuation BinaryWriter::IfState::advance(class BinaryWriter& writer,
     }
     return Continuation::CONTINUE;
   }
+  WriteOpcode(writer.stream_, Opcode::End);
   return Continuation::FRAME_OVER;
 }
 
@@ -1291,12 +1293,16 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
   write_expr(top_expr);
 
   while (!stack.empty()) {
-    State& state =
-        std::visit([](auto& state) -> State& { return state; }, stack.back());
-    write_expr(state.get_current_expr());
+    State* state =
+        &std::visit([](auto& state) -> State& { return state; }, stack.back());
+    write_expr(state->get_current_expr());
     while (!stack.empty() &&
-           state.advance(*this, func) == Continuation::FRAME_OVER) {
+           state->advance(*this, func) == Continuation::FRAME_OVER) {
       stack.pop_back();
+      state = stack.empty()
+                  ? static_cast<State*>(nullptr)
+                  : &std::visit([](auto& state) -> State& { return state; },
+                                stack.back());
     }
   }
 }
