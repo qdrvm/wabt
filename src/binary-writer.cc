@@ -579,6 +579,7 @@ Continuation BinaryWriter::IfState::advance(class BinaryWriter& writer,
         return Continuation::FRAME_OVER;
       }
     }
+    return Continuation::CONTINUE;
   }
   return Continuation::FRAME_OVER;
 }
@@ -1027,6 +1028,9 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
       if (!(if_expr->true_.exprs.empty() && if_expr->false_.empty())) {
+        if (if_expr->true_.exprs.empty()) {
+          WriteOpcode(stream_, Opcode::Else);
+        }
         return IfState{if_expr};
       } else {
         WriteOpcode(stream_, Opcode::End);
