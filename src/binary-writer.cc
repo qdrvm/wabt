@@ -426,7 +426,10 @@ class BinaryWriter {
 
   struct IfState final : StateBase<IfExpr> {
     explicit IfState(const IfExpr* expr)
-        : StateBase{expr->true_.exprs.begin(), expr} {}
+        : StateBase{expr->true_.exprs.empty() ? expr->false_.begin()
+                                              : expr->true_.exprs.begin(),
+                    expr},
+          in_else(expr->true_.exprs.empty()) {}
 
     Continuation advance(class BinaryWriter& writer, const Func* func) override;
 
@@ -901,7 +904,12 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
     case ExprType::Block:
       WriteOpcode(stream_, Opcode::Block);
       WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      return BlockState<ExprType::Block>{cast<BlockExpr>(expr)};
+      if (!cast<BlockExpr>(expr)->block.exprs.empty()) {
+        return BlockState<ExprType::Block>{cast<BlockExpr>(expr)};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
+      }
 
     case ExprType::Br:
       WriteOpcode(stream_, Opcode::Br);
@@ -1018,7 +1026,12 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
       auto* if_expr = cast<IfExpr>(expr);
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
-      return IfState{if_expr};
+      if (!(if_expr->true_.exprs.empty() && if_expr->false_.empty())) {
+        return IfState{if_expr};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
+      }
     }
     case ExprType::Load:
       WriteLoadStoreExpr<LoadExpr>(func, expr, "load offset");
@@ -1044,7 +1057,12 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
     case ExprType::Loop:
       WriteOpcode(stream_, Opcode::Loop);
       WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      return BlockState<ExprType::Loop>{cast<LoopExpr>(expr)};
+      if (!cast<LoopExpr>(expr)->block.exprs.empty()) {
+        return BlockState<ExprType::Loop>{cast<LoopExpr>(expr)};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
+      }
 
     case ExprType::MemoryCopy: {
       Index destmemidx =
@@ -1272,7 +1290,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
     State& state =
         std::visit([](auto& state) -> State& { return state; }, stack.back());
     write_expr(state.get_current_expr());
-    while (!stack.empty() && state.advance(*this, func) == Continuation::FRAME_OVER) {
+    while (!stack.empty() &&
+           state.advance(*this, func) == Continuation::FRAME_OVER) {
       stack.pop_back();
     }
   }
