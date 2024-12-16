@@ -375,11 +375,6 @@ struct CodeMetadataSection {
 using CodeMetadataSections =
     std::unordered_map<std::string_view, CodeMetadataSection>;
 
-enum class Continuation {
-  CONTINUE,
-  FRAME_OVER,
-};
-
 class BinaryWriter {
   WABT_DISALLOW_COPY_AND_ASSIGN(BinaryWriter);
 
