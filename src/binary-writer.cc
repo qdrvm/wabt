@@ -395,8 +395,12 @@ class BinaryWriter {
    public:
     State(ExprList::const_iterator current_expr) : current_expr(current_expr) {}
 
-    virtual std::optional<const Expr*> advance(class BinaryWriter& writer,
-                                               const Func* func) = 0;
+    const Expr* get_current_and_advance() {
+      auto* curr = &*current_expr;
+      ++current_expr;
+      return curr;
+    }
+
    protected:
     ExprList::const_iterator current_expr;
   };
@@ -416,18 +420,17 @@ class BinaryWriter {
         : StateBase<BlockExprBase<T>>{expr->block.exprs.begin(), expr} {}
 
     std::optional<const Expr*> advance(class BinaryWriter& writer,
-                                       const Func* func) override;
+                                       const Func* func);
   };
 
   struct IfState final : StateBase<IfExpr> {
     explicit IfState(const IfExpr* expr)
-        : StateBase{expr->true_.exprs.empty() ? expr->false_.begin()
-                                              : expr->true_.exprs.begin(),
+        : StateBase{expr->true_.exprs.begin(),
                     expr},
-          in_else(expr->true_.exprs.empty()) {}
+          in_else(false) {}
 
     std::optional<const Expr*> advance(class BinaryWriter& writer,
-                                       const Func* func) override;
+                                       const Func* func);
 
    private:
     bool in_else = false;
@@ -437,7 +440,7 @@ class BinaryWriter {
     explicit TryState(const TryExpr* expr)
         : StateBase{expr->block.exprs.begin(), expr} {}
     std::optional<const Expr*> advance(class BinaryWriter& writer,
-                                       const Func* func) override;
+                                       const Func* func);
 
    private:
     bool in_catch = false;
@@ -539,9 +542,7 @@ std::optional<const Expr*> BinaryWriter::BlockState<T>::advance(
     class BinaryWriter& writer,
     const Func* func) {
   if (this->current_expr != this->expr->block.exprs.end()) {
-    auto res = this->current_expr;
-    ++this->current_expr;
-    return &*res;
+    return this->get_current_and_advance();
   }
   WriteOpcode(writer.stream_, Opcode::End);
   return std::nullopt;
@@ -551,34 +552,20 @@ std::optional<const Expr*> BinaryWriter::IfState::advance(
     class BinaryWriter& writer,
     const Func* func) {
   if (!in_else) {
-    if (!expr->true_.exprs.empty() &&
-        (current_expr != expr->true_.exprs.end())) {
-      auto res = &*current_expr;
-      current_expr++;
-      return res;
-    } else {
-      if (!expr->false_.empty()) {
-        WriteOpcode(writer.stream_, Opcode::Else);
-        current_expr = expr->false_.begin();
-        auto res = &*current_expr;
-        current_expr++;
-        in_else = true;
-        return res;
-      } else {
-        WriteOpcode(writer.stream_, Opcode::End);
-        return std::nullopt;
-      }
+    if (current_expr != expr->true_.exprs.end()) {
+      return get_current_and_advance();
     }
-  } else {
-    if (current_expr != expr->false_.end()) {
-      auto res = &*current_expr;
-      current_expr++;
-      return res;
-    } else {
-      WriteOpcode(writer.stream_, Opcode::End);
-      return std::nullopt;
+    if (!expr->false_.empty()) {
+      WriteOpcode(writer.stream_, Opcode::Else);
     }
+    current_expr = expr->false_.begin();
+    in_else = true;
   }
+  if (current_expr != expr->false_.end()) {
+    return get_current_and_advance();
+  }
+  WriteOpcode(writer.stream_, Opcode::End);
+  return std::nullopt;
 }
 
 std::optional<const Expr*> BinaryWriter::TryState::advance(
@@ -586,24 +573,21 @@ std::optional<const Expr*> BinaryWriter::TryState::advance(
     const Func* func) {
   if (!in_catch) {
     if (current_expr != expr->block.exprs.end()) {
-      auto res = &*current_expr;
-      current_expr++;
-      return res;
-    } else {
-      switch (expr->kind) {
-        case TryKind::Catch:
-          in_catch = true;
-          break;
-        case TryKind::Delegate:
-          WriteOpcode(writer.stream_, Opcode::Delegate);
-          WriteU32Leb128(writer.stream_,
-                         writer.GetLabelVarDepth(&expr->delegate_target),
-                         "delegate depth");
-          return std::nullopt;
-        case TryKind::Plain:
-          WriteOpcode(writer.stream_, Opcode::End);
-          return std::nullopt;
-      }
+      return get_current_and_advance();
+    }
+    switch (expr->kind) {
+      case TryKind::Catch:
+        in_catch = true;
+        break;
+      case TryKind::Delegate:
+        WriteOpcode(writer.stream_, Opcode::Delegate);
+        WriteU32Leb128(writer.stream_,
+                       writer.GetLabelVarDepth(&expr->delegate_target),
+                       "delegate depth");
+        return std::nullopt;
+      case TryKind::Plain:
+        WriteOpcode(writer.stream_, Opcode::End);
+        return std::nullopt;
     }
   }
   // deliberately no else
@@ -621,30 +605,22 @@ std::optional<const Expr*> BinaryWriter::TryState::advance(
                            "catch tag");
           }
         }
-        auto res = &*current_expr;
-        current_expr++;
-        return res;
-      } else {
-        do {
-          current_catch++;
-        } while (current_catch < expr->catches.size() &&
-                 expr->catches[current_catch].exprs.empty());
-        if (current_catch < expr->catches.size()) {
-          auto& catch_block = expr->catches[current_catch];
-          current_expr = catch_block.exprs.begin();
-          auto res = &*current_expr;
-          current_expr++;
-          return res;
-
-        } else {
-          WriteOpcode(writer.stream_, Opcode::End);
-          return std::nullopt;
-        }
+        return get_current_and_advance();
       }
-    } else {
+      do {
+        current_catch++;
+      } while (current_catch < expr->catches.size() &&
+               expr->catches[current_catch].exprs.empty());
+      if (current_catch < expr->catches.size()) {
+        auto& catch_block = expr->catches[current_catch];
+        current_expr = catch_block.exprs.begin();
+        return get_current_and_advance();
+      }
       WriteOpcode(writer.stream_, Opcode::End);
       return std::nullopt;
     }
+    WriteOpcode(writer.stream_, Opcode::End);
+    return std::nullopt;
   }
   WABT_UNREACHABLE;
 }
@@ -1045,9 +1021,6 @@ std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
       if (!(if_expr->true_.exprs.empty() && if_expr->false_.empty())) {
-        if (if_expr->true_.exprs.empty()) {
-          WriteOpcode(stream_, Opcode::Else);
-        }
         return IfState{if_expr};
       } else {
         WriteOpcode(stream_, Opcode::End);
@@ -1307,9 +1280,9 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
   write_expr(top_expr);
 
   while (!stack.empty()) {
-    State* state =
-        &std::visit([](auto& state) -> State& { return state; }, stack.back());
-    auto expr = state->advance(*this, func);
+    auto expr = std::visit(
+        [this, func](auto& state) { return state.advance(*this, func); },
+        stack.back());
     if (expr) {
       write_expr(expr.value());
     } else {
