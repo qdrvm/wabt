@@ -598,13 +598,12 @@ const Expr* BinaryWriter::TryState::advance(class BinaryWriter& writer,
         current_catch++;
       } while (current_catch < expr->catches.size() &&
                expr->catches[current_catch].exprs.empty());
+               
       if (current_catch < expr->catches.size()) {
         auto& catch_block = expr->catches[current_catch];
         current_expr = catch_block.exprs.begin();
         return get_current_and_advance();
       }
-      WriteOpcode(writer.stream_, Opcode::End);
-      return nullptr;
     }
     WriteOpcode(writer.stream_, Opcode::End);
     return nullptr;
