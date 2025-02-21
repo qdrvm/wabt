@@ -565,6 +565,11 @@ const Expr* BinaryWriter::TryState::advance(class BinaryWriter& writer,
     switch (expr->kind) {
       case TryKind::Catch:
         in_catch = true;
+        // shouldn't happen, but we don't want to crash if it does
+        if(expr->catches.empty()) {
+            return nullptr;
+        }
+        current_expr = expr->catches.front().exprs.begin();
         break;
       case TryKind::Delegate:
         WriteOpcode(writer.stream_, Opcode::Delegate);
@@ -578,35 +583,28 @@ const Expr* BinaryWriter::TryState::advance(class BinaryWriter& writer,
     }
   }
   // deliberately no else
+
   if (in_catch) {
-    if (current_catch < expr->catches.size()) {
+    while (current_catch < expr->catches.size()) {
       auto& catch_block = expr->catches[current_catch];
-      if (current_expr != catch_block.exprs.end()) {
-        if (current_expr == catch_block.exprs.begin()) {
-          if (catch_block.IsCatchAll()) {
-            WriteOpcode(writer.stream_, Opcode::CatchAll);
-          } else {
-            WriteOpcode(writer.stream_, Opcode::Catch);
-            WriteU32Leb128(writer.stream_,
-                           writer.GetTagVarDepth(&catch_block.var),
-                           "catch tag");
-          }
+      if (current_expr == catch_block.exprs.begin()) {
+        if (catch_block.IsCatchAll()) {
+          WriteOpcode(writer.stream_, Opcode::CatchAll);
+        } else {
+          WriteOpcode(writer.stream_, Opcode::Catch);
+          WriteU32Leb128(writer.stream_,
+                         writer.GetTagVarDepth(&catch_block.var), "catch tag");
         }
-        return get_current_and_advance();
       }
-      do {
-        current_catch++;
-      } while (current_catch < expr->catches.size() &&
-               expr->catches[current_catch].exprs.empty());
-      if (current_catch < expr->catches.size()) {
-        auto& catch_block = expr->catches[current_catch];
-        current_expr = catch_block.exprs.begin();
+      if (current_expr != catch_block.exprs.end()) {
         return get_current_and_advance();
       }
       WriteOpcode(writer.stream_, Opcode::End);
-      return nullptr;
+      current_catch++;
+      if (current_catch < expr->catches.size()) {
+        current_expr = expr->catches[current_catch].exprs.begin();
+      }
     }
-    WriteOpcode(writer.stream_, Opcode::End);
     return nullptr;
   }
   WABT_UNREACHABLE;
