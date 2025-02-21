@@ -599,12 +599,12 @@ const Expr* BinaryWriter::TryState::advance(class BinaryWriter& writer,
       if (current_expr != catch_block.exprs.end()) {
         return get_current_and_advance();
       }
-      WriteOpcode(writer.stream_, Opcode::End);
       current_catch++;
       if (current_catch < expr->catches.size()) {
         current_expr = expr->catches[current_catch].exprs.begin();
       }
     }
+    WriteOpcode(writer.stream_, Opcode::End);
     return nullptr;
   }
   WABT_UNREACHABLE;
