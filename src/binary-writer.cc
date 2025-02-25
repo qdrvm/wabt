@@ -21,9 +21,11 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <set>
+#include <stack>
 #include <string_view>
-#include <vector>
+#include <variant>
 
 #include "wabt/config.h"
 
@@ -384,6 +386,62 @@ class BinaryWriter {
   Result WriteModule();
 
  private:
+  struct State {
+   public:
+    State(ExprList::const_iterator current_expr) : current_expr(current_expr) {}
+
+    const Expr* get_current_and_advance() {
+      auto* curr = &*current_expr;
+      ++current_expr;
+      return curr;
+    }
+
+   protected:
+    ExprList::const_iterator current_expr;
+  };
+
+  template <typename ExprType>
+  struct StateBase : State {
+    StateBase(ExprList::const_iterator current_expr, const ExprType* const expr)
+        : State(current_expr), expr(expr) {}
+
+   protected:
+    const ExprType* const expr;
+  };
+
+  template <ExprType T>
+  struct BlockState final : StateBase<BlockExprBase<T>> {
+    explicit BlockState(const BlockExprBase<T>* expr)
+        : StateBase<BlockExprBase<T>>{expr->block.exprs.begin(), expr} {}
+
+    const Expr* advance(class BinaryWriter& writer, const Func* func);
+  };
+
+  struct IfState final : StateBase<IfExpr> {
+    explicit IfState(const IfExpr* expr)
+        : StateBase{expr->true_.exprs.begin(), expr}, in_else(false) {}
+
+    const Expr* advance(class BinaryWriter& writer, const Func* func);
+
+   private:
+    bool in_else = false;
+  };
+
+  struct TryState final : StateBase<TryExpr> {
+    explicit TryState(const TryExpr* expr)
+        : StateBase{expr->block.exprs.begin(), expr} {}
+    const Expr* advance(class BinaryWriter& writer, const Func* func);
+
+   private:
+    size_t current_catch = 0;
+    bool in_catch = false;
+  };
+
+  using StateVar = std::variant<BlockState<ExprType::Loop>,
+                                BlockState<ExprType::Block>,
+                                IfState,
+                                TryState>;
+
   void WriteHeader(const char* name, int index);
   Offset WriteU32Leb128Space(Offset leb_size_guess, const char* desc);
   Offset WriteFixupU32Leb128Size(Offset offset,
@@ -415,6 +473,7 @@ class BinaryWriter {
                                   const Expr* expr,
                                   const char* desc);
   void WriteExpr(const Func* func, const Expr* expr);
+  std::optional<StateVar> WriteExprImpl(const Func* func, const Expr* expr);
   void WriteExprList(const Func* func, const ExprList& exprs);
   void WriteInitExpr(const ExprList& expr);
   void WriteFuncLocals(const Func* func, const LocalTypes& local_types);
@@ -466,6 +525,89 @@ static uint8_t log2_u32(uint32_t x) {
     result++;
   }
   return result;
+}
+
+template <ExprType T>
+const Expr* BinaryWriter::BlockState<T>::advance(class BinaryWriter& writer,
+                                                 const Func* func) {
+  if (this->current_expr != this->expr->block.exprs.end()) {
+    return this->get_current_and_advance();
+  }
+  WriteOpcode(writer.stream_, Opcode::End);
+  return nullptr;
+}
+
+const Expr* BinaryWriter::IfState::advance(class BinaryWriter& writer,
+                                           const Func* func) {
+  if (!in_else) {
+    if (current_expr != expr->true_.exprs.end()) {
+      return get_current_and_advance();
+    }
+    if (!expr->false_.empty()) {
+      WriteOpcode(writer.stream_, Opcode::Else);
+    }
+    current_expr = expr->false_.begin();
+    in_else = true;
+  }
+  if (current_expr != expr->false_.end()) {
+    return get_current_and_advance();
+  }
+  WriteOpcode(writer.stream_, Opcode::End);
+  return nullptr;
+}
+
+const Expr* BinaryWriter::TryState::advance(class BinaryWriter& writer,
+                                            const Func* func) {
+  if (!in_catch) {
+    if (current_expr != expr->block.exprs.end()) {
+      return get_current_and_advance();
+    }
+    switch (expr->kind) {
+      case TryKind::Catch:
+        in_catch = true;
+        // shouldn't happen, but we don't want to crash if it does
+        if(expr->catches.empty()) {
+            return nullptr;
+        }
+        current_expr = expr->catches.front().exprs.begin();
+        break;
+      case TryKind::Delegate:
+        WriteOpcode(writer.stream_, Opcode::Delegate);
+        WriteU32Leb128(writer.stream_,
+                       writer.GetLabelVarDepth(&expr->delegate_target),
+                       "delegate depth");
+        return nullptr;
+      case TryKind::Plain:
+        WriteOpcode(writer.stream_, Opcode::End);
+        return nullptr;
+    }
+  }
+  // deliberately no else
+
+  if (in_catch) {
+    while (current_catch < expr->catches.size()) {
+      auto& catch_block = expr->catches[current_catch];
+      if (current_expr == catch_block.exprs.begin()) {
+        if (catch_block.IsCatchAll()) {
+          WriteOpcode(writer.stream_, Opcode::CatchAll);
+        } else {
+          WriteOpcode(writer.stream_, Opcode::Catch);
+          WriteU32Leb128(writer.stream_,
+                         writer.GetTagVarDepth(&catch_block.var), "catch tag");
+        }
+      }
+      if (current_expr != catch_block.exprs.end()) {
+        return get_current_and_advance();
+      }
+      current_catch++;
+      if (current_catch < expr->catches.size()) {
+        current_expr = expr->catches[current_catch].exprs.begin();
+      }
+    }
+    WriteOpcode(writer.stream_, Opcode::End);
+    return nullptr;
+  }
+  WABT_UNREACHABLE;
 }
 
 BinaryWriter::BinaryWriter(Stream* stream,
@@ -625,9 +767,9 @@ void BinaryWriter::AddReloc(RelocType reloc_type, Index index) {
   size_t offset = stream_->offset() - last_section_payload_offset_;
   Index symbol_index = GetSymbolIndex(reloc_type, index);
   if (symbol_index == kInvalidIndex) {
-    // The file is invalid, for example a reference to function 42 where only 10
-    // functions are defined.  The user must have already passed --no-check, so
-    // no extra warning here is needed.
+    // The file is invalid, for example a reference to function 42 where only
+    // 10 functions are defined.  The user must have already passed
+    // --no-check, so no extra warning here is needed.
     return;
   }
   current_reloc_section_->relocations.emplace_back(reloc_type, offset,
@@ -657,8 +799,8 @@ void BinaryWriter::WriteS32Leb128WithReloc(int32_t value,
 }
 
 void BinaryWriter::WriteTableNumberWithReloc(Index value, const char* desc) {
-  // Unless reference types are enabled, all references to tables refer to table
-  // 0, so no relocs need be emitted when making relocatable binaries.
+  // Unless reference types are enabled, all references to tables refer to
+  // table 0, so no relocs need be emitted when making relocatable binaries.
   if (options_.relocatable && options_.features.reference_types_enabled()) {
     AddReloc(RelocType::TableNumberLEB, value);
     WriteFixedS32Leb128(stream_, value, desc);
@@ -706,7 +848,9 @@ void BinaryWriter::WriteSimdLoadStoreLaneExpr(const Func* func,
   stream_->WriteU8(static_cast<uint8_t>(typed_expr->val), "Simd Lane literal");
 }
 
-void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
+std::optional<BinaryWriter::StateVar> BinaryWriter::WriteExprImpl(
+    const Func* func,
+    const Expr* expr) {
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -739,9 +883,13 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Block:
       WriteOpcode(stream_, Opcode::Block);
       WriteBlockDecl(cast<BlockExpr>(expr)->block.decl);
-      WriteExprList(func, cast<BlockExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      if (!cast<BlockExpr>(expr)->block.exprs.empty()) {
+        return BlockState<ExprType::Block>{cast<BlockExpr>(expr)};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
+      }
+
     case ExprType::Br:
       WriteOpcode(stream_, Opcode::Br);
       WriteU32Leb128(stream_, GetLabelVarDepth(&cast<BrExpr>(expr)->var),
@@ -857,13 +1005,12 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* if_expr = cast<IfExpr>(expr);
       WriteOpcode(stream_, Opcode::If);
       WriteBlockDecl(if_expr->true_.decl);
-      WriteExprList(func, if_expr->true_.exprs);
-      if (!if_expr->false_.empty()) {
-        WriteOpcode(stream_, Opcode::Else);
-        WriteExprList(func, if_expr->false_);
+      if (!(if_expr->true_.exprs.empty() && if_expr->false_.empty())) {
+        return IfState{if_expr};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
       }
-      WriteOpcode(stream_, Opcode::End);
-      break;
     }
     case ExprType::Load:
       WriteLoadStoreExpr<LoadExpr>(func, expr, "load offset");
@@ -889,9 +1036,13 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
     case ExprType::Loop:
       WriteOpcode(stream_, Opcode::Loop);
       WriteBlockDecl(cast<LoopExpr>(expr)->block.decl);
-      WriteExprList(func, cast<LoopExpr>(expr)->block.exprs);
-      WriteOpcode(stream_, Opcode::End);
-      break;
+      if (!cast<LoopExpr>(expr)->block.exprs.empty()) {
+        return BlockState<ExprType::Loop>{cast<LoopExpr>(expr)};
+      } else {
+        WriteOpcode(stream_, Opcode::End);
+        break;
+      }
+
     case ExprType::MemoryCopy: {
       Index destmemidx =
           module_->GetMemoryIndex(cast<MemoryCopyExpr>(expr)->destmemidx);
@@ -1047,30 +1198,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       auto* try_expr = cast<TryExpr>(expr);
       WriteOpcode(stream_, Opcode::Try);
       WriteBlockDecl(try_expr->block.decl);
-      WriteExprList(func, try_expr->block.exprs);
-      switch (try_expr->kind) {
-        case TryKind::Catch:
-          for (const Catch& catch_ : try_expr->catches) {
-            if (catch_.IsCatchAll()) {
-              WriteOpcode(stream_, Opcode::CatchAll);
-            } else {
-              WriteOpcode(stream_, Opcode::Catch);
-              WriteU32Leb128(stream_, GetTagVarDepth(&catch_.var), "catch tag");
-            }
-            WriteExprList(func, catch_.exprs);
-          }
-          WriteOpcode(stream_, Opcode::End);
-          break;
-        case TryKind::Delegate:
-          WriteOpcode(stream_, Opcode::Delegate);
-          WriteU32Leb128(stream_, GetLabelVarDepth(&try_expr->delegate_target),
-                         "delegate depth");
-          break;
-        case TryKind::Plain:
-          WriteOpcode(stream_, Opcode::End);
-          break;
-      }
-      break;
+      return TryState{try_expr};
     }
     case ExprType::Unary:
       WriteOpcode(stream_, cast<UnaryExpr>(expr)->opcode);
@@ -1119,6 +1247,31 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       Offset code_offset = stream_->offset() - cur_func_start_offset_;
       a.entries.emplace_back(code_offset, meta_expr->data);
       break;
+    }
+  }
+  return std::nullopt;
+}
+
+void BinaryWriter::WriteExpr(const Func* func, const Expr* top_expr) {
+  std::stack<StateVar> stack;
+
+  auto write_expr = [&stack, func, this](const Expr* expr) {
+    auto opt_state = WriteExprImpl(func, expr);
+    if (opt_state.has_value()) {
+      auto& state = *opt_state;
+      stack.push(state);
+    }
+  };
+  write_expr(top_expr);
+
+  while (!stack.empty()) {
+    auto expr = std::visit(
+        [this, func](auto& state) { return state.advance(*this, func); },
+        stack.top());
+    if (expr) {
+      write_expr(expr);
+    } else {
+      stack.pop();
     }
   }
 }
@@ -1616,7 +1769,8 @@ Result BinaryWriter::WriteModule() {
     EndSection();
   }
 
-  // Remove the DataCount section if there are no instructions that require it.
+  // Remove the DataCount section if there are no instructions that require
+  // it.
   if (options_.features.bulk_memory_enabled() &&
       module_->data_segments.size() && !has_data_segment_instruction_) {
     Offset size = stream_->offset() - data_count_end_;
@@ -1633,8 +1787,8 @@ Result BinaryWriter::WriteModule() {
 
     --section_count_;
 
-    // We just effectively decremented the code section's index; adjust anything
-    // that might have captured it.
+    // We just effectively decremented the code section's index; adjust
+    // anything that might have captured it.
     for (RelocSection& section : reloc_sections_) {
       if (section.section_index == section_count_) {
         assert(last_section_type_ == BinarySection::Code);
